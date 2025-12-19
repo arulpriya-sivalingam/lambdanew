@@ -1,0 +1,275 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Network account - Lambda + execution role for auto-associating resolver rules to new VPCs (Checkov aligned)
+
+Parameters:
+  LambdaFunctionName:
+    Type: String
+    Default: dnsvpcAssociationLambda
+
+  LambdaExecutionRoleName:
+    Type: String
+    Default: dnsvpcAssociationLambdaRole
+
+  CrossAccountRoleName:
+    Type: String
+    Default: NetworkDnsAutomationRole
+    Description: Role name that exists in each spoke/target account (assumed by this Lambda)
+
+  TargetRoleArns:
+    Type: CommaDelimitedList
+    Description: >
+      Comma-separated list of target role ARNs Lambda is allowed to assume.
+      Example:
+      arn:aws:iam::111111111111:role/NetworkDnsAutomationRole,arn:aws:iam::222222222222:role/NetworkDnsAutomationRole
+
+  LambdaSubnetIds:
+    Type: CommaDelimitedList
+    Description: Private subnet IDs for Lambda VPC config (network account)
+
+  LambdaSecurityGroupIds:
+    Type: CommaDelimitedList
+    Description: Security group IDs for Lambda VPC config (network account)
+
+  ReservedConcurrency:
+    Type: Number
+    Default: 5
+
+Resources:
+  #############################################
+  # KMS (CKV_AWS_173)
+  #############################################
+  LambdaEnvKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: CMK for Lambda env vars and DLQ encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowRootAccount
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: 'kms:*'
+            Resource: '*'
+
+  LambdaEnvKmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${LambdaFunctionName}-kms"
+      TargetKeyId: !Ref LambdaEnvKmsKey
+
+  #############################################
+  # DLQ (CKV_AWS_116)
+  #############################################
+  DnsvpcDlqQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${LambdaFunctionName}-dlq"
+      KmsMasterKeyId: !Ref LambdaEnvKmsKey
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  #############################################
+  # Managed policy (avoid inline policies on role)
+  #############################################
+  DnsvpcLambdaManagedPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Policy for DNS VPC association Lambda (network account)
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow assuming only the roles you explicitly pass (no wildcard)
+          - Sid: AssumeOnlyTargetRoles
+            Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Resource: !Ref TargetRoleArns
+
+          # Network account reads: list rules + tags (AWS requires Resource "*")
+          - Sid: NetworkListRulesAndTags
+            Effect: Allow
+            Action:
+              - route53resolver:ListResolverRules
+              - route53resolver:ListTagsForResource
+            Resource: "*"
+
+          # Optional debug
+          - Sid: GetCallerIdentity
+            Effect: Allow
+            Action:
+              - sts:GetCallerIdentity
+            Resource: "*"
+
+  #############################################
+  # Lambda execution role
+  #############################################
+  # If your scanner still flags CKV_AWS_111 here due to AWS-required "*", you can skip it:
+  # checkov:skip=CKV_AWS_111: Route53Resolver list APIs require Resource="*"; sts:AssumeRole is restricted to explicit TargetRoleArns.
+  DnsvpcAssociationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref LambdaExecutionRoleName
+      Description: Lambda execution role in network account
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # CloudWatch logs
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        # Our permissions
+        - !Ref DnsvpcLambdaManagedPolicy
+
+  #############################################
+  # Lambda function
+  #############################################
+  DnsvpcAssociationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Description: Auto associate Global resolver rules to newly created VPCs across accounts
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 90
+      MemorySize: 256
+      Role: !GetAtt DnsvpcAssociationLambdaRole.Arn
+
+      # CKV_AWS_115
+      ReservedConcurrentExecutions: !Ref ReservedConcurrency
+
+      # CKV_AWS_173
+      KmsKeyArn: !Ref LambdaEnvKmsKey
+
+      # CKV_AWS_116
+      DeadLetterConfig:
+        TargetArn: !GetAtt DnsvpcDlqQueue.Arn
+
+      # CKV_AWS_117
+      VpcConfig:
+        SubnetIds: !Ref LambdaSubnetIds
+        SecurityGroupIds: !Ref LambdaSecurityGroupIds
+
+      Environment:
+        Variables:
+          CROSS_ACCOUNT_ROLE_NAME: !Ref CrossAccountRoleName
+          RULE_SCOPE_TAG: "VPCAssociation"
+          GLOBAL_SCOPE_TAG: "Global"
+
+      Code:
+        ZipFile: |
+          import logging
+          import os
+          import boto3
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          sts = boto3.client("sts")
+
+          CROSS_ACCOUNT_ROLE_NAME = os.getenv("CROSS_ACCOUNT_ROLE_NAME", "NetworkDnsAutomationRole")
+          RULE_SCOPE_TAG = os.getenv("RULE_SCOPE_TAG", "VPCAssociation")
+          GLOBAL_SCOPE_TAG = os.getenv("GLOBAL_SCOPE_TAG", "Global")
+
+          def network_resolver(region):
+              return boto3.client("route53resolver", region_name=region)
+
+          def assume_into_account(account_id, role_name, region):
+              role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
+              resp = sts.assume_role(RoleArn=role_arn, RoleSessionName="dnsvpc-auto-associate")
+              c = resp["Credentials"]
+              return boto3.Session(
+                  aws_access_key_id=c["AccessKeyId"],
+                  aws_secret_access_key=c["SecretAccessKey"],
+                  aws_session_token=c["SessionToken"],
+                  region_name=region,
+              )
+
+          def get_global_rules(region):
+              r53 = network_resolver(region)
+              ids = []
+              paginator = r53.get_paginator("list_resolver_rules")
+              for page in paginator.paginate():
+                  for rule in page.get("ResolverRules", []):
+                      rule_id = rule["Id"]
+                      rule_arn = rule["Arn"]
+                      try:
+                          tags = r53.list_tags_for_resource(ResourceArn=rule_arn).get("Tags", [])
+                      except ClientError as e:
+                          logger.error(f"Tag read failed for rule {rule_id}: {e}")
+                          continue
+                      tag_map = {t["Key"]: t["Value"] for t in tags}
+                      if tag_map.get(RULE_SCOPE_TAG) == GLOBAL_SCOPE_TAG:
+                          ids.append(rule_id)
+              logger.info(f"Global rules: {ids}")
+              return ids
+
+          def existing_associations(session, region, vpc_id):
+              client = session.client("route53resolver", region_name=region)
+              existing = set()
+              paginator = client.get_paginator("list_resolver_rule_associations")
+              filters = [{"Name": "VPCId", "Values": [vpc_id]}]
+              for page in paginator.paginate(Filters=filters):
+                  for assoc in page.get("ResolverRuleAssociations", []):
+                      existing.add(assoc["ResolverRuleId"])
+              return existing
+
+          def associate_missing(session, region, account_id, vpc_id, rule_ids):
+              client = session.client("route53resolver", region_name=region)
+              existing = existing_associations(session, region, vpc_id)
+              missing = [r for r in rule_ids if r not in existing]
+              if not missing:
+                  logger.info(f"No missing rules for {vpc_id} in {account_id}")
+                  return
+              for rule in missing:
+                  try:
+                      logger.info(f"Associating rule {rule} -> VPC {vpc_id} in {account_id}")
+                      client.associate_resolver_rule(
+                          ResolverRuleId=rule,
+                          VPCId=vpc_id,
+                          Name=f"auto-{rule}-{vpc_id}",
+                      )
+                  except ClientError as e:
+                      logger.error(f"Associate failed rule={rule} vpc={vpc_id} acct={account_id}: {e}")
+
+          def lambda_handler(event, context):
+              logger.info(f"Event: {event}")
+              account_id = event.get("account")
+              region = event.get("region")
+              if not account_id or not region:
+                  logger.error("Missing account/region")
+                  return
+
+              detail = event.get("detail", {})
+              vpc_id = detail.get("responseElements", {}).get("vpc", {}).get("vpcId")
+              if not vpc_id:
+                  logger.error("No vpcId found in event.detail.responseElements.vpc")
+                  return
+
+              global_rules = get_global_rules(region)
+              if not global_rules:
+                  logger.warning("No Global rules found in network account")
+                  return
+
+              try:
+                  session = assume_into_account(account_id, CROSS_ACCOUNT_ROLE_NAME, region)
+              except ClientError as e:
+                  logger.error(f"AssumeRole failed for account {account_id}: {e}")
+                  return
+
+              associate_missing(session, region, account_id, vpc_id, global_rules)
+              logger.info("Completed")
+
+Outputs:
+  LambdaRoleArn:
+    Value: !GetAtt DnsvpcAssociationLambdaRole.Arn
+  LambdaArn:
+    Value: !GetAtt DnsvpcAssociationLambda.Arn
+  DlqArn:
+    Value: !GetAtt DnsvpcDlqQueue.Arn
+  KmsKeyArn:
+    Value: !GetAtt LambdaEnvKmsKey.Arn
