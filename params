@@ -1,0 +1,30 @@
+[
+  {
+    "ParameterKey": "LambdaFunctionName",
+    "ParameterValue": "dnsvpcAssociationLambda"
+  },
+  {
+    "ParameterKey": "LambdaExecutionRoleName",
+    "ParameterValue": "dnsvpcautomationRole"
+  },
+  {
+    "ParameterKey": "CrossAccountRoleName",
+    "ParameterValue": "NetworkDnsAutomationRole"
+  },
+  {
+    "ParameterKey": "TargetRoleArns",
+    "ParameterValue": "arn:aws:iam::111111111111:role/NetworkDnsAutomationRole,arn:aws:iam::222222222222:role/NetworkDnsAutomationRole"
+  },
+  {
+    "ParameterKey": "LambdaSubnetIds",
+    "ParameterValue": "subnet-aaaa1111,subnet-bbbb2222"
+  },
+  {
+    "ParameterKey": "LambdaSecurityGroupIds",
+    "ParameterValue": "sg-cccc3333"
+  },
+  {
+    "ParameterKey": "ReservedConcurrency",
+    "ParameterValue": "5"
+  }
+]
