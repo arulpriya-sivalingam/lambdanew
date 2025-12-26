@@ -1,0 +1,49 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  EventBridge rule in SUB account to forward CreateVpc CloudTrail events
+  to an EventBridge event bus in the Network account.
+
+Parameters:
+  NetworkAccountId:
+    Type: String
+    Description: AWS Account ID of the Network account (where Lambda lives)
+
+  NetworkEventBusName:
+    Type: String
+    Default: default
+    Description: Name of the EventBridge event bus in the Network account
+    # If you are using the default bus in the Network account, leave as "default"
+    # If you created a custom bus (e.g. "VpcAssociationBus"), put that name here.
+
+  RuleName:
+    Type: String
+    Default: Forward-CreateVpc-To-NetworkBus
+    Description: Name for the EventBridge rule in this sub account
+
+Resources:
+  CreateVpcForwardRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Ref RuleName
+      Description: >
+        Forwards CreateVpc CloudTrail events from this sub account
+        to the Network account EventBridge event bus.
+      EventPattern:
+        source:
+          - "aws.ec2"
+        detail-type:
+          - "AWS API Call via CloudTrail"
+        detail:
+          eventSource:
+            - "ec2.amazonaws.com"
+          eventName:
+            - "CreateVpc"
+      State: ENABLED
+      Targets:
+        - Id: "ToNetworkEventBus"
+          Arn: !Sub "arn:aws:events:${AWS::Region}:${NetworkAccountId}:event-bus/${NetworkEventBusName}"
+
+Outputs:
+  RuleArn:
+    Description: ARN of the EventBridge rule in this sub account
+    Value: !GetAtt CreateVpcForwardRule.Arn
