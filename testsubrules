@@ -1,0 +1,108 @@
+import boto3
+import os
+
+# -----------------------------
+# Config
+# -----------------------------
+# Set your region here OR via environment variable AWS_REGION
+REGION = os.getenv("AWS_REGION", "eu-west-1")
+
+# Optional: if you only care about one VPC, set it here (or leave as "" for all)
+VPC_FILTER = ""  # e.g. "vpc-0abc123def456"
+
+
+def get_resolver_client(region: str):
+    return boto3.client("route53resolver", region_name=region)
+
+
+def list_resolver_rules(client):
+    """Return dict of rule_id -> rule_info."""
+    rules = {}
+    paginator = client.get_paginator("list_resolver_rules")
+
+    for page in paginator.paginate():
+        for rule in page.get("ResolverRules", []):
+            rule_id = rule["Id"]
+            rules[rule_id] = {
+                "Name": rule.get("Name", ""),
+                "DomainName": rule.get("DomainName", ""),
+                "RuleType": rule.get("RuleType", ""),
+                "OwnerId": rule.get("OwnerId", ""),
+                "Arn": rule.get("Arn", ""),
+            }
+    return rules
+
+
+def list_rule_associations(client, vpc_filter=None):
+    """Return list of associations (each is a dict)."""
+    assocs = []
+    paginator = client.get_paginator("list_resolver_rule_associations")
+
+    base_kwargs = {}
+    if vpc_filter:
+        base_kwargs["Filters"] = [{"Name": "VPCId", "Values": [vpc_filter]}]
+
+    for page in paginator.paginate(**base_kwargs):
+        for assoc in page.get("ResolverRuleAssociations", []):
+            assocs.append(
+                {
+                    "Id": assoc.get("Id", ""),
+                    "ResolverRuleId": assoc.get("ResolverRuleId", ""),
+                    "VPCId": assoc.get("VPCId", ""),
+                    "Name": assoc.get("Name", ""),
+                    "Status": assoc.get("Status", ""),
+                }
+            )
+    return assocs
+
+
+def main():
+    print(f"Using region: {REGION}")
+    if VPC_FILTER:
+        print(f"Filtering associations for VPC: {VPC_FILTER}")
+    else:
+        print("Showing associations for ALL VPCs in this account")
+
+    client = get_resolver_client(REGION)
+
+    # 1) List all rules
+    rules = list_resolver_rules(client)
+    print("\n=== Resolver rules visible in this account ===")
+    for rid, info in rules.items():
+        print(
+            f"- ID: {rid}\n"
+            f"  Name      : {info['Name']}\n"
+            f"  Domain    : {info['DomainName']}\n"
+            f"  RuleType  : {info['RuleType']}\n"
+            f"  OwnerId   : {info['OwnerId']}\n"
+        )
+
+    # 2) List associations
+    assocs = list_rule_associations(client, VPC_FILTER or None)
+
+    if not assocs:
+        print("\nNo resolver rule associations found.")
+        return
+
+    # Group by VPC
+    print("\n=== Resolver rule associations by VPC ===")
+    by_vpc = {}
+    for a in assocs:
+        by_vpc.setdefault(a["VPCId"], []).append(a)
+
+    for vpc_id, items in by_vpc.items():
+        print(f"\nVPC: {vpc_id}")
+        for a in items:
+            rule_info = rules.get(a["ResolverRuleId"], {})
+            print(
+                f"  - AssocId  : {a['Id']}\n"
+                f"    RuleId   : {a['ResolverRuleId']}\n"
+                f"    RuleName : {rule_info.get('Name', '')}\n"
+                f"    Domain   : {rule_info.get('DomainName', '')}\n"
+                f"    Status   : {a['Status']}\n"
+                f"    AssocName: {a['Name']}\n"
+            )
+
+
+if __name__ == "__main__":
+    main()
