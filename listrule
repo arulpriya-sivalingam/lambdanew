@@ -1,0 +1,9 @@
+  msg = str(e)
+                if "RSLVR-00903" in msg or "cannot tag auto Defined Rule" in msg:
+                    logger.info(
+                        "Skipping auto-defined resolver rule %s (cannot read tags)", rule_id
+                    )
+                    continue
+
+                logger.error("Error listing tags for rule %s: %s", rule_id, msg)
+                continue
